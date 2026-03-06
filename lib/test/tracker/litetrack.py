@@ -21,6 +21,13 @@ class LiteTrack(BaseTracker):
     def __init__(self, params, dataset_name):
         super(LiteTrack, self).__init__(params)
         network = build_LiteTrack(params.cfg, training=False)
+        if not os.path.isfile(self.params.checkpoint):
+            raise FileNotFoundError(
+                "Checkpoint not found: {}. "
+                "Please place model weights at this path (or run with another --epoch).".format(
+                    self.params.checkpoint
+                )
+            )
         network.load_state_dict(torch.load(self.params.checkpoint, map_location='cpu')['net'], strict=False)
 
         self.cfg = params.cfg

@@ -149,8 +149,10 @@ class Tracker:
 
         return output
 
-    def run_video(self, videofilepath, optional_box=None, debug=None, visdom_info=None, save_results=False):
-        """Run the tracker with the vieofile.
+    def run_video(self, videofilepath=None, camera_id=None, camera_width=1920, camera_height=1080,
+                  camera_fps=None, camera_fourcc='MJPG', optional_box=None, debug=None,
+                  visdom_info=None, save_results=False):
+        """Run the tracker with a video file or webcam.
         args:
             debug: Debug level.
         """
@@ -173,50 +175,142 @@ class Tracker:
         else:
             raise ValueError('Unknown multi object mode {}'.format(multiobj_mode))
 
-        assert os.path.isfile(videofilepath), "Invalid param {}".format(videofilepath)
-        ", videofilepath must be a valid videofile"
-
         output_boxes = []
+        if camera_id is None:
+            assert videofilepath is not None and os.path.isfile(videofilepath), \
+                "videofilepath must be a valid videofile"
+            cap = cv.VideoCapture(videofilepath)
+            save_name = Path(videofilepath).stem
+        else:
+            cap = cv.VideoCapture(camera_id)
+            if camera_fourcc is not None and camera_fourcc != '':
+                assert len(camera_fourcc) == 4, "camera_fourcc must be a 4-char code, e.g. MJPG"
+                cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*camera_fourcc))
+            if camera_width is not None:
+                cap.set(cv.CAP_PROP_FRAME_WIDTH, int(camera_width))
+            if camera_height is not None:
+                cap.set(cv.CAP_PROP_FRAME_HEIGHT, int(camera_height))
+            if camera_fps is not None:
+                cap.set(cv.CAP_PROP_FPS, float(camera_fps))
+            save_name = 'camera_{}_{}'.format(camera_id, int(time.time()))
 
-        cap = cv.VideoCapture(videofilepath)
+        if not cap.isOpened():
+            raise RuntimeError('Cannot open {}'.format(
+                videofilepath if camera_id is None else 'camera {}'.format(camera_id)))
+        if camera_id is not None:
+            actual_width = int(cap.get(cv.CAP_PROP_FRAME_WIDTH))
+            actual_height = int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))
+            actual_fps = cap.get(cv.CAP_PROP_FPS)
+            print('Camera {} requested {}x{}{}{}; actual {}x{} @ {:.2f} FPS'.format(
+                camera_id,
+                camera_width if camera_width is not None else 'default',
+                camera_height if camera_height is not None else 'default',
+                '' if camera_fps is None else ' @ ',
+                '' if camera_fps is None else '{} FPS'.format(camera_fps),
+                actual_width, actual_height, actual_fps))
+
         display_name = 'Display: ' + self.tracker.params.tracker_name
         cv.namedWindow(display_name, cv.WINDOW_NORMAL | cv.WINDOW_KEEPRATIO)
         cv.resizeWindow(display_name, 960, 720)
-        success, frame = cap.read()
-        cv.imshow(display_name, frame)
 
         def _build_init_info(box):
             return {'init_bbox': box}
 
-        if success is not True:
-            print("Read frame from {} failed.".format(videofilepath))
-            exit(-1)
+        def _read_frame_with_retry(max_retry=5, sleep_s=0.005):
+            retries = max_retry if camera_id is not None else 1
+            for _ in range(retries):
+                try:
+                    ret, read_frame = cap.read()
+                except cv.error:
+                    ret, read_frame = False, None
+                if ret and read_frame is not None and read_frame.size > 0:
+                    return True, read_frame
+                if camera_id is not None:
+                    time.sleep(sleep_s)
+            return False, None
+
+        def _select_roi_on_frame(frame):
+            frame_disp = frame.copy()
+            cv.putText(frame_disp, 'Select target ROI and press ENTER', (20, 30), cv.FONT_HERSHEY_COMPLEX_SMALL,
+                       1.5, (0, 0, 0), 1)
+            x, y, w, h = cv.selectROI(display_name, frame_disp, fromCenter=False)
+            return [int(x), int(y), int(w), int(h)]
+
+        def _wait_for_camera_roi():
+            while True:
+                ret, live_frame = _read_frame_with_retry(max_retry=8)
+                if not ret or live_frame is None:
+                    key = cv.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        return None, None, True
+                    continue
+
+                frame_disp = live_frame.copy()
+                cv.putText(frame_disp, 'Press SPACE/f to freeze', (20, 30), cv.FONT_HERSHEY_COMPLEX_SMALL, 1,
+                           (0, 0, 0), 1)
+                cv.putText(frame_disp, 'Press q to quit', (20, 55), cv.FONT_HERSHEY_COMPLEX_SMALL, 1,
+                           (0, 0, 0), 1)
+                cv.imshow(display_name, frame_disp)
+                key = cv.waitKey(1) & 0xFF
+
+                if key == ord('q'):
+                    return None, None, True
+                if key in (ord(' '), ord('f')):
+                    init_state = _select_roi_on_frame(live_frame)
+                    if init_state[2] > 0 and init_state[3] > 0:
+                        return live_frame, init_state, False
+
+        frame = None
         if optional_box is not None:
             assert isinstance(optional_box, (list, tuple))
             assert len(optional_box) == 4, "valid box's foramt is [x,y,w,h]"
+            success, frame = _read_frame_with_retry(max_retry=8)
+            if not success or frame is None:
+                raise RuntimeError("Read frame failed.")
             self.tracker.initialize(frame, _build_init_info(optional_box))
             output_boxes.append(optional_box)
+        elif camera_id is None:
+            success, frame = _read_frame_with_retry(max_retry=8)
+            if not success or frame is None:
+                raise RuntimeError("Read frame from {} failed.".format(videofilepath))
+            cv.imshow(display_name, frame)
+            init_state = _select_roi_on_frame(frame)
+            if init_state[2] <= 0 or init_state[3] <= 0:
+                cap.release()
+                cv.destroyAllWindows()
+                return
+            self.tracker.initialize(frame, _build_init_info(init_state))
+            output_boxes.append(init_state)
         else:
-            while True:
-                # cv.waitKey()
-                frame_disp = frame.copy()
+            frame, init_state, should_quit = _wait_for_camera_roi()
+            if should_quit:
+                cap.release()
+                cv.destroyAllWindows()
+                return
+            self.tracker.initialize(frame, _build_init_info(init_state))
+            output_boxes.append(init_state)
 
-                cv.putText(frame_disp, 'Select target ROI and press ENTER', (20, 30), cv.FONT_HERSHEY_COMPLEX_SMALL,
-                           1.5, (0, 0, 0), 1)
-
-                x, y, w, h = cv.selectROI(display_name, frame_disp, fromCenter=False)
-                init_state = [x, y, w, h]
-                self.tracker.initialize(frame, _build_init_info(init_state))
-                output_boxes.append(init_state)
-                break
+        prev_frame_time = time.time()
+        smooth_fps = 0.0
 
         while True:
-            ret, frame = cap.read()
+            ret, frame = _read_frame_with_retry(max_retry=3)
 
-            if frame is None:
-                break
+            if not ret or frame is None:
+                if camera_id is None:
+                    break
+                key = cv.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                continue
 
             frame_disp = frame.copy()
+
+            now = time.time()
+            dt = now - prev_frame_time
+            prev_frame_time = now
+            instant_fps = 1.0 / dt if dt > 0 else 0.0
+            smooth_fps = instant_fps if smooth_fps == 0.0 else 0.9 * smooth_fps + 0.1 * instant_fps
 
             # Draw box
             out = self.tracker.track(frame)
@@ -226,29 +320,35 @@ class Tracker:
             cv.rectangle(frame_disp, (state[0], state[1]), (state[2] + state[0], state[3] + state[1]),
                          (0, 255, 0), 5)
 
-            font_color = (0, 0, 0)
-            cv.putText(frame_disp, 'Tracking!', (20, 30), cv.FONT_HERSHEY_COMPLEX_SMALL, 1,
-                       font_color, 1)
-            cv.putText(frame_disp, 'Press r to reset', (20, 55), cv.FONT_HERSHEY_COMPLEX_SMALL, 1,
-                       font_color, 1)
-            cv.putText(frame_disp, 'Press q to quit', (20, 80), cv.FONT_HERSHEY_COMPLEX_SMALL, 1,
-                       font_color, 1)
+            font_color = (57, 255, 20)
+            font_scale = 1.2
+            font_thickness = 2
+            cv.putText(frame_disp, 'FPS: {:.2f}'.format(smooth_fps), (20, 35), cv.FONT_HERSHEY_COMPLEX_SMALL,
+                       font_scale, font_color, font_thickness)
+            cv.putText(frame_disp, 'Tracking!', (20, 65), cv.FONT_HERSHEY_COMPLEX_SMALL,
+                       font_scale, font_color, font_thickness)
+            cv.putText(frame_disp, 'Press r to reset', (20, 95), cv.FONT_HERSHEY_COMPLEX_SMALL,
+                       font_scale, font_color, font_thickness)
+            cv.putText(frame_disp, 'Press q to quit', (20, 125), cv.FONT_HERSHEY_COMPLEX_SMALL,
+                       font_scale, font_color, font_thickness)
 
             # Display the resulting frame
             cv.imshow(display_name, frame_disp)
-            key = cv.waitKey(1)
+            key = cv.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
             elif key == ord('r'):
-                ret, frame = cap.read()
-                frame_disp = frame.copy()
-
-                cv.putText(frame_disp, 'Select target ROI and press ENTER', (20, 30), cv.FONT_HERSHEY_COMPLEX_SMALL, 1.5,
-                           (0, 0, 0), 1)
-
-                cv.imshow(display_name, frame_disp)
-                x, y, w, h = cv.selectROI(display_name, frame_disp, fromCenter=False)
-                init_state = [x, y, w, h]
+                if camera_id is None:
+                    ret, frame = _read_frame_with_retry(max_retry=8)
+                    if not ret or frame is None:
+                        break
+                    init_state = _select_roi_on_frame(frame)
+                    if init_state[2] <= 0 or init_state[3] <= 0:
+                        continue
+                else:
+                    frame, init_state, should_quit = _wait_for_camera_roi()
+                    if should_quit:
+                        break
                 self.tracker.initialize(frame, _build_init_info(init_state))
                 output_boxes.append(init_state)
 
@@ -259,8 +359,7 @@ class Tracker:
         if save_results:
             if not os.path.exists(self.results_dir):
                 os.makedirs(self.results_dir)
-            video_name = Path(videofilepath).stem
-            base_results_path = os.path.join(self.results_dir, 'video_{}'.format(video_name))
+            base_results_path = os.path.join(self.results_dir, 'video_{}'.format(save_name))
 
             tracked_bb = np.array(output_boxes).astype(int)
             bbox_file = '{}.txt'.format(base_results_path)
@@ -281,6 +380,3 @@ class Tracker:
         #     return decode_img(image_file[0], image_file[1])
         else:
             raise ValueError("type of image_file should be str or list")
-
-
-
